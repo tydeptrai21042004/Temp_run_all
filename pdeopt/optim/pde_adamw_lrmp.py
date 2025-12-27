@@ -1,24 +1,38 @@
 from typing import Optional, Tuple
+import math
 import torch
+
 from ..pde.apply import apply_spatial_pde, apply_spatial_pde_saitoh
 from ..pde.spectral import SpectralPDE
 from ..core.metrics import hf_energy_2d, lap_energy_2d
 
+
 class PDE_AdamW_LRMP(torch.optim.Optimizer):
     """
-    PDE-AdamW-LRMP:
-      - compute AdamW preconditioner r_t
-      - optional time-filter on r_t
-      - PDE smooth r_t (plain / saitoh)
-      - mix r_t with r_smooth by LRMP rho_t
+    PDE-AdamW-LRMP (deep-learning improved, core math preserved):
+      Core:
+        - AdamW moments -> r_t = (v_hat + eps)^(-1/2)
+        - PDE smooth r_t (plain/saitoh) on 2D geometry tensors only
+        - LRMP mixing: rho_t = rho0 + (1-rho0)*tanh(q_t)
+
+      Improvements (keep core math):
+        1) Log-domain smoothing: smooth u=log(r+delta), then exp back
+        2) Robust q: clip / optional quantile, compute stats in fp32
+        3) rho EMA: smooth rho over time (per-parameter)
+        4) PDE schedule: warmup -> on -> decay (multiplier on PDE effect)
+        5) Update-to-weight coupling: use u=||Δθ||/(||θ||+eps) to self-tune PDE strength
+        6) Time-filter EMA stored in state[p] (resume-safe)
 
     Ablations:
       rho_mode = "lrmp" | "const" | "off"
       pde_mode = "plain" | "saitoh"
 
-    Optional:
-      track_smoothness=True to log roughness metrics of r_t before/after PDE smoothing.
+    Practical knobs:
+      - pde_every
+      - min_param_numel
+      - allow_rect_linear (but your apply.py now disables Linear reshape by default unless explicitly enabled)
     """
+
     def __init__(
         self,
         params,
@@ -27,38 +41,112 @@ class PDE_AdamW_LRMP(torch.optim.Optimizer):
         eps=1e-8,
         weight_decay=0.0,
         op: Optional[SpectralPDE] = None,
-        rho0=0.6,
+        rho0=0.1,
         lr_cap=1e3,
-        clip_update: Optional[float] = 1.0,
+        clip_update: Optional[float] = None,
         rho_mode: str = "lrmp",
         rho_const: Optional[float] = None,
+
+        # --- LRMP noise estimation ---
+        beta_g: Optional[float] = None,       # EMA on gradient for q_t (paper-style)
+        beta_r: Optional[float] = None,       # backward compat (treated as beta_g)
+
+        # --- optional time smoothing on r_t ---
         use_time_filter: bool = False,
-        beta_r: Optional[float] = None,
         time_beta: float = 0.9,
+
+        # --- PDE mode ---
         pde_mode: str = "plain",
         saitoh_rho_alpha: float = 0.15,
         saitoh_eps: float = 1e-6,
+
+        # --- reshape for Linear ---
         linear_hw: Optional[Tuple[int, int]] = None,
+        allow_rect_linear: bool = False,
+        min_rect_side: int = 8,
+
+        # --- apply frequency ---
+        pde_every: int = 1,
+
+        # --- skip tiny tensors / no-geometry ---
+        min_param_numel: int = 512,
+
+        # --- logging ---
         track_smoothness: bool = False,
+
+        # ============================
+        # NEW: log-domain smoothing
+        # ============================
+        use_log_smooth: bool = True,
+        log_smooth_delta: float = 1e-12,
+
+        # ============================
+        # NEW: robust q + rho EMA
+        # ============================
+        q_clip: float = 10.0,
+        q_quantile: Optional[float] = None,   # e.g. 0.5 for median; None => mean of clipped
+        rho_ema_beta: float = 0.9,            # EMA on rho to avoid jitter (0 disables)
+
+        # ============================
+        # NEW: schedules (PDE strength)
+        # ============================
+        rho_warmup_steps: int = 0,            # warmup rho (mixing) from 0 -> rho over these steps
+        pde_warmup_steps: int = 0,            # warmup PDE multiplier 0 -> 1
+        pde_decay_start: int = 0,             # start step for decay (0 disables decay)
+        pde_decay_end: int = 0,               # end step for decay (<=start disables decay)
+        pde_min_mult: float = 0.1,            # multiplier at end of decay
+
+        # ============================
+        # NEW: update-to-weight coupling
+        # ============================
+        u_beta: float = 0.9,                  # EMA for update/weight ratio (0 disables)
+        u_target: float = 1e-3,               # target ratio
+        u_gain: float = 1.0,                  # exponent for scaling
+        u_mult_min: float = 0.5,
+        u_mult_max: float = 2.0,
     ):
-        if beta_r is not None:
-            use_time_filter = True
-            time_beta = float(beta_r)
+        # Backward compatibility
+        if beta_g is None and beta_r is not None:
+            beta_g = float(beta_r)
 
         defaults = dict(
             lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
             rho0=rho0, lr_cap=lr_cap, clip_update=clip_update,
             rho_mode=rho_mode, rho_const=rho_const,
+            beta_g=beta_g,
             use_time_filter=use_time_filter, time_beta=time_beta,
             pde_mode=pde_mode, saitoh_rho_alpha=saitoh_rho_alpha, saitoh_eps=saitoh_eps,
             linear_hw=linear_hw,
+            allow_rect_linear=allow_rect_linear,
+            min_rect_side=min_rect_side,
+            pde_every=int(max(1, pde_every)),
+            min_param_numel=int(max(0, min_param_numel)),
             track_smoothness=track_smoothness,
+
+            # NEW
+            use_log_smooth=bool(use_log_smooth),
+            log_smooth_delta=float(log_smooth_delta),
+            q_clip=float(q_clip),
+            q_quantile=(float(q_quantile) if q_quantile is not None else None),
+            rho_ema_beta=float(rho_ema_beta),
+
+            rho_warmup_steps=int(max(0, rho_warmup_steps)),
+            pde_warmup_steps=int(max(0, pde_warmup_steps)),
+            pde_decay_start=int(max(0, pde_decay_start)),
+            pde_decay_end=int(max(0, pde_decay_end)),
+            pde_min_mult=float(pde_min_mult),
+
+            u_beta=float(u_beta),
+            u_target=float(u_target),
+            u_gain=float(u_gain),
+            u_mult_min=float(u_mult_min),
+            u_mult_max=float(u_mult_max),
         )
         super().__init__(params, defaults)
 
         self.op = op
         self._step = 0
-        self._time_state = {}
+
         self._rho_sum = 0.0
         self._rho_n = 0
 
@@ -68,12 +156,12 @@ class PDE_AdamW_LRMP(torch.optim.Optimizer):
     def get_epoch_stats(self):
         out = {}
         if self._rho_n > 0:
-            out["rho_mean"] = self._rho_sum / max(1, self._rho_n)
+            out["rho_mean"] = float(self._rho_sum / max(1, self._rho_n))
         if self._sm_n > 0:
-            out["r_hf_before"] = self._sm_sum["hf_b"] / self._sm_n
-            out["r_hf_after"] = self._sm_sum["hf_a"] / self._sm_n
-            out["r_lap_before"] = self._sm_sum["lap_b"] / self._sm_n
-            out["r_lap_after"] = self._sm_sum["lap_a"] / self._sm_n
+            out["r_hf_before"] = float(self._sm_sum["hf_b"] / self._sm_n)
+            out["r_hf_after"] = float(self._sm_sum["hf_a"] / self._sm_n)
+            out["r_lap_before"] = float(self._sm_sum["lap_b"] / self._sm_n)
+            out["r_lap_after"] = float(self._sm_sum["lap_a"] / self._sm_n)
         return out
 
     def reset_epoch_stats(self):
@@ -84,6 +172,7 @@ class PDE_AdamW_LRMP(torch.optim.Optimizer):
         self._sm_n = 0
 
     def _maybe_track(self, p: torch.Tensor, r: torch.Tensor, rs: torch.Tensor):
+        # Only track when we truly have 2D geometry
         if p.ndim == 2 and r.ndim == 2 and int(p.shape[1]) == 28 * 28:
             rb = r.reshape(int(r.shape[0]), 28, 28)
             ra = rs.reshape(int(rs.shape[0]), 28, 28)
@@ -93,11 +182,34 @@ class PDE_AdamW_LRMP(torch.optim.Optimizer):
             ra = rs.reshape(-1, kH, kW)
         else:
             return
-        self._sm_sum["hf_b"] += hf_energy_2d(rb)
-        self._sm_sum["hf_a"] += hf_energy_2d(ra)
-        self._sm_sum["lap_b"] += lap_energy_2d(rb)
-        self._sm_sum["lap_a"] += lap_energy_2d(ra)
+
+        self._sm_sum["hf_b"] += float(hf_energy_2d(rb))
+        self._sm_sum["hf_a"] += float(hf_energy_2d(ra))
+        self._sm_sum["lap_b"] += float(lap_energy_2d(rb))
+        self._sm_sum["lap_a"] += float(lap_energy_2d(ra))
         self._sm_n += 1
+
+    @staticmethod
+    def _pde_schedule_mult(
+        t: int,
+        warmup_steps: int,
+        decay_start: int,
+        decay_end: int,
+        min_mult: float,
+    ) -> float:
+        # warmup: 0 -> 1
+        if warmup_steps > 0 and t < warmup_steps:
+            return float(t) / float(max(1, warmup_steps))
+
+        mult = 1.0
+
+        # decay: 1 -> min_mult
+        if decay_start > 0 and decay_end > decay_start and t >= decay_start:
+            frac = float(t - decay_start) / float(max(1, decay_end - decay_start))
+            frac = max(0.0, min(1.0, frac))
+            mult = 1.0 - frac * (1.0 - float(min_mult))
+
+        return float(mult)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -117,18 +229,64 @@ class PDE_AdamW_LRMP(torch.optim.Optimizer):
             rho_const = group.get("rho_const", None)
             rho_const = float(rho_const) if rho_const is not None else None
 
+            beta_g = group.get("beta_g", None)
+            beta_g = float(beta_g) if beta_g is not None else None
+
             use_time_filter = bool(group["use_time_filter"])
             time_beta = float(group["time_beta"])
 
             pde_mode = str(group.get("pde_mode", "plain")).lower().strip()
             saitoh_rho_alpha = float(group.get("saitoh_rho_alpha", 0.15))
             saitoh_eps = float(group.get("saitoh_eps", 1e-6))
+
             linear_hw = group.get("linear_hw", None)
+            allow_rect_linear = bool(group.get("allow_rect_linear", False))
+            min_rect_side = int(group.get("min_rect_side", 8))
+
+            pde_every = int(group.get("pde_every", 1))
+            min_param_numel = int(group.get("min_param_numel", 0))
             track_smoothness = bool(group.get("track_smoothness", False))
+
+            # NEW knobs
+            use_log_smooth = bool(group.get("use_log_smooth", True))
+            log_delta = float(group.get("log_smooth_delta", 1e-12))
+
+            q_clip = float(group.get("q_clip", 10.0))
+            q_quantile = group.get("q_quantile", None)
+            q_quantile = float(q_quantile) if q_quantile is not None else None
+
+            rho_ema_beta = float(group.get("rho_ema_beta", 0.9))
+
+            rho_warmup_steps = int(group.get("rho_warmup_steps", 0))
+            pde_warmup_steps = int(group.get("pde_warmup_steps", 0))
+            pde_decay_start = int(group.get("pde_decay_start", 0))
+            pde_decay_end = int(group.get("pde_decay_end", 0))
+            pde_min_mult = float(group.get("pde_min_mult", 0.1))
+
+            u_beta = float(group.get("u_beta", 0.9))
+            u_target = float(group.get("u_target", 1e-3))
+            u_gain = float(group.get("u_gain", 1.0))
+            u_mult_min = float(group.get("u_mult_min", 0.5))
+            u_mult_max = float(group.get("u_mult_max", 2.0))
+
+            # PDE schedule multiplier (group-level)
+            pde_mult = self._pde_schedule_mult(
+                t=t,
+                warmup_steps=pde_warmup_steps,
+                decay_start=pde_decay_start,
+                decay_end=pde_decay_end,
+                min_mult=pde_min_mult,
+            )
+
+            # rho warmup factor (group-level)
+            rho_warm = 1.0
+            if rho_warmup_steps > 0 and t < rho_warmup_steps:
+                rho_warm = float(t) / float(max(1, rho_warmup_steps))
 
             for p in group["params"]:
                 if p.grad is None:
                     continue
+
                 g = p.grad
                 if g.is_sparse:
                     g = g.to_dense()
@@ -141,72 +299,187 @@ class PDE_AdamW_LRMP(torch.optim.Optimizer):
                 m = state["exp_avg"]
                 v = state["exp_avg_sq"]
 
+                # AdamW decoupled weight decay
                 if wd != 0.0:
-                    p.mul_(1.0 - lr * wd)
+                    p.add_(p, alpha=-lr * wd)
 
+                # Moments
                 m.mul_(beta1).add_(g, alpha=1.0 - beta1)
                 v.mul_(beta2).addcmul_(g, g, value=1.0 - beta2)
 
+                # Bias correction
                 bc1 = 1.0 - beta1 ** t
                 bc2 = 1.0 - beta2 ** t
                 m_hat = m / bc1
                 v_hat = v / bc2
 
+                # Preconditioner
                 r = torch.rsqrt(v_hat + eps)
                 r = torch.clamp(r, max=lr_cap)
 
+                # -------------------------
+                # LRMP rho (per-parameter)
+                # -------------------------
                 if rho_mode == "off":
                     rho = 0.0
                 elif rho_mode == "const":
                     rho = float(rho_const if rho_const is not None else rho0)
                 else:
-                    g2 = g.pow(2).mean()
-                    if float(g2.item()) == 0.0:
-                        rho = 0.0
-                    else:
-                        nr = (g - m).pow(2).mean() / (g2 + 1e-12)
-                        nr = float(torch.clamp(nr, 0.0, 1.0).item())
-                        rho = rho0 * nr
+                    # q_t: noise indicator (compute in fp32 for AMP stability)
+                    if beta_g is not None:
+                        g_ema = state.get("g_ema", None)
+                        if g_ema is None or g_ema.shape != g.shape:
+                            g_ema = torch.zeros_like(g)
+                        g_ema.mul_(beta_g).add_(g, alpha=1.0 - beta_g)
+                        state["g_ema"] = g_ema
 
-                self._rho_sum += rho
+                        gf = g.float()
+                        ge = g_ema.float()
+                        q_elem = (gf - ge).pow(2) / (gf.pow(2) + 1e-12)
+                    else:
+                        mh = m_hat.float()
+                        vh = v_hat.float()
+                        q_elem = (vh - mh.pow(2)).clamp_min(0.0) / (vh + 1e-12)
+
+                    if q_quantile is not None:
+                        # e.g. median: q_quantile=0.5
+                        q_val = torch.quantile(q_elem.reshape(-1), q_quantile)
+                        q_val = torch.clamp(q_val, 0.0, q_clip)
+                    else:
+                        q_val = q_elem.clamp(0.0, q_clip).mean()
+
+                    rho_t = rho0 + (1.0 - rho0) * torch.tanh(q_val)
+                    rho = float(torch.clamp(rho_t, 0.0, 0.999).item())
+
+                # rho EMA (per-parameter) to reduce jitter
+                if rho_ema_beta > 0.0 and rho_mode not in ("off",):
+                    prev_rho = float(state.get("rho_ema", rho))
+                    rho = float(rho_ema_beta * prev_rho + (1.0 - rho_ema_beta) * rho)
+                    state["rho_ema"] = rho
+
+                # Apply rho warmup (ramps mixing on)
+                rho = float(rho * rho_warm)
+
+                # -------------------------
+                # Time-filter EMA on r (resume-safe)
+                # -------------------------
+                if use_time_filter:
+                    r_ema = state.get("r_ema", None)
+                    if r_ema is None or r_ema.shape != r.shape:
+                        r_ema = r.detach().clone()
+                    else:
+                        r_ema.mul_(time_beta).add_(r, alpha=1.0 - time_beta)
+                    state["r_ema"] = r_ema
+                    r = r_ema
+
+                # -------------------------
+                # Update-to-weight coupling (uses previous u_ema)
+                # -------------------------
+                u_mult = 1.0
+                if u_beta > 0.0 and u_target > 0.0:
+                    u_ema_prev = float(state.get("u_ema", u_target))
+                    ratio = u_ema_prev / float(u_target)
+                    # if ratio>1 => updates too big => more smoothing
+                    u_mult = float(ratio ** float(u_gain))
+                    u_mult = float(max(u_mult_min, min(u_mult_max, u_mult)))
+
+                # Effective PDE mixing coefficient (only affects PDE part)
+                rho_pde = float(rho * pde_mult * u_mult)
+                rho_pde = float(max(0.0, min(0.999, rho_pde)))
+
+                # Track actual mixing used (more meaningful than base rho)
+                self._rho_sum += rho_pde
                 self._rho_n += 1
 
-                if use_time_filter:
-                    key = id(p)
-                    prev = self._time_state.get(key, None)
-                    if prev is None or prev.shape != r.shape:
-                        self._time_state[key] = r.detach().clone()
+                # -------------------------
+                # PDE smoothing (only on eligible tensors)
+                # -------------------------
+                do_pde = (
+                    self.op is not None
+                    and rho_pde > 0.0
+                    and p.ndim in (2, 4)
+                    and p.numel() >= min_param_numel
+                )
+
+                if do_pde:
+                    need_refresh = (pde_every <= 1) or (t % pde_every == 0) or ("pde_rs" not in state)
+
+                    if need_refresh:
+                        # log-domain smoothing
+                        if use_log_smooth:
+                            u = r.clamp_min(log_delta).log()
+                            if pde_mode == "saitoh":
+                                u_s = apply_spatial_pde_saitoh(
+                                    p, u, self.op, step_t=t,
+                                    rho_alpha=saitoh_rho_alpha, eps=saitoh_eps,
+                                    linear_hw=linear_hw,
+                                    allow_rect_linear=allow_rect_linear,
+                                    min_rect_side=min_rect_side,
+                                )
+                            else:
+                                u_s = apply_spatial_pde(
+                                    p, u, self.op, step_t=t,
+                                    linear_hw=linear_hw,
+                                    allow_rect_linear=allow_rect_linear,
+                                    min_rect_side=min_rect_side,
+                                )
+                            rs = u_s.exp()
+                        else:
+                            if pde_mode == "saitoh":
+                                rs = apply_spatial_pde_saitoh(
+                                    p, r, self.op, step_t=t,
+                                    rho_alpha=saitoh_rho_alpha, eps=saitoh_eps,
+                                    linear_hw=linear_hw,
+                                    allow_rect_linear=allow_rect_linear,
+                                    min_rect_side=min_rect_side,
+                                )
+                            else:
+                                rs = apply_spatial_pde(
+                                    p, r, self.op, step_t=t,
+                                    linear_hw=linear_hw,
+                                    allow_rect_linear=allow_rect_linear,
+                                    min_rect_side=min_rect_side,
+                                )
+
+                        rs = torch.clamp(rs, min=0.0, max=lr_cap)
+                        state["pde_rs"] = rs.detach()
                     else:
-                        self._time_state[key].mul_(time_beta).add_(r, alpha=1.0 - time_beta)
-                    r = self._time_state[key]
+                        rs = state["pde_rs"].to(device=r.device, dtype=r.dtype)
 
-                if self.op is not None and rho > 0.0:
-                    if pde_mode == "saitoh":
-                        rs = apply_spatial_pde_saitoh(
-                            p, r, self.op, step_t=t,
-                            rho_alpha=saitoh_rho_alpha, eps=saitoh_eps,
-                            linear_hw=linear_hw,
-                        )
-                    else:
-                        rs = apply_spatial_pde(p, r, self.op, step_t=t, linear_hw=linear_hw)
-
-                    rs = torch.clamp(rs, min=0.0, max=lr_cap)
-
-                    if track_smoothness:
+                    if track_smoothness and need_refresh:
                         self._maybe_track(p, r, rs)
 
-                    r = (1.0 - rho) * r + rho * rs
+                    # Mix
+                    r = (1.0 - rho_pde) * r + rho_pde * rs
 
+                # -------------------------
+                # Update
+                # -------------------------
                 upd = m_hat * r
+
+                # Optional per-tensor update norm clipping
                 if clip_update is not None:
-                    nrm = upd.norm().clamp(min=1e-12)
                     c = float(clip_update)
+                    nrm = upd.norm().clamp(min=1e-12)
                     if nrm.item() > c:
                         upd.mul_(c / nrm)
 
+                # Apply update
                 p.add_(upd, alpha=-lr)
 
+                # -------------------------
+                # Update u_ema after we know upd (for next step)
+                # -------------------------
+                if u_beta > 0.0 and u_target > 0.0:
+                    # ||Δθ|| / (||θ|| + eps)
+                    denom = float(p.data.norm().item()) + 1e-12
+                    numer = float(upd.norm().item())
+                    u_now = numer / denom
+                    u_prev = float(state.get("u_ema", u_now))
+                    state["u_ema"] = float(u_beta * u_prev + (1.0 - u_beta) * u_now)
+
         return None
+
 
 class PDE_AdamW_LRMP_SAITOH(PDE_AdamW_LRMP):
     def __init__(self, *args, saitoh_rho_alpha: float = 0.15, **kwargs):
