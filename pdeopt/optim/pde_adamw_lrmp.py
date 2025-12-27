@@ -10,10 +10,13 @@ from ..core.metrics import hf_energy_2d, lap_energy_2d
 class PDE_AdamW_LRMP(torch.optim.Optimizer):
     """
     PDE-AdamW-LRMP (deep-learning improved, core math preserved):
+
       Core:
         - AdamW moments -> r_t = (v_hat + eps)^(-1/2)
-        - PDE smooth r_t (plain/saitoh) on 2D geometry tensors only
-        - LRMP mixing: rho_t = rho0 + (1-rho0)*tanh(q_t)
+        - PDE smooth r_t (plain/saitoh) on geometry tensors only
+        - LRMP mixing (UPDATED):
+            rho_t = rho_min + (rho_max - rho_min) * tanh(q_t)
+          so rho can go near 0 when noise is low (prevents over-smoothing).
 
       Improvements (keep core math):
         1) Log-domain smoothing: smooth u=log(r+delta), then exp back
@@ -23,14 +26,14 @@ class PDE_AdamW_LRMP(torch.optim.Optimizer):
         5) Update-to-weight coupling: use u=||Δθ||/(||θ||+eps) to self-tune PDE strength
         6) Time-filter EMA stored in state[p] (resume-safe)
 
+      NEW (requested):
+        7) Log-space mixing (geometric interpolation) instead of linear r-space mixing
+        8) Preserve mean/DC scale of r after PDE smoothing (prevents implicit LR change)
+        9) Apply PDE only to conv kernels by default (optional MNIST first linear reshape)
+
     Ablations:
       rho_mode = "lrmp" | "const" | "off"
       pde_mode = "plain" | "saitoh"
-
-    Practical knobs:
-      - pde_every
-      - min_param_numel
-      - allow_rect_linear (but your apply.py now disables Linear reshape by default unless explicitly enabled)
     """
 
     def __init__(
@@ -41,7 +44,12 @@ class PDE_AdamW_LRMP(torch.optim.Optimizer):
         eps=1e-8,
         weight_decay=0.0,
         op: Optional[SpectralPDE] = None,
+
+        # Backward compatible: rho0 remains; if rho_max=None, rho_max := rho0
         rho0=0.1,
+        rho_min: float = 0.0,
+        rho_max: Optional[float] = None,
+
         lr_cap=1e3,
         clip_update: Optional[float] = None,
         rho_mode: str = "lrmp",
@@ -75,20 +83,20 @@ class PDE_AdamW_LRMP(torch.optim.Optimizer):
         track_smoothness: bool = False,
 
         # ============================
-        # NEW: log-domain smoothing
+        # log-domain smoothing
         # ============================
         use_log_smooth: bool = True,
         log_smooth_delta: float = 1e-12,
 
         # ============================
-        # NEW: robust q + rho EMA
+        # robust q + rho EMA
         # ============================
         q_clip: float = 10.0,
         q_quantile: Optional[float] = None,   # e.g. 0.5 for median; None => mean of clipped
         rho_ema_beta: float = 0.9,            # EMA on rho to avoid jitter (0 disables)
 
         # ============================
-        # NEW: schedules (PDE strength)
+        # schedules (PDE strength)
         # ============================
         rho_warmup_steps: int = 0,            # warmup rho (mixing) from 0 -> rho over these steps
         pde_warmup_steps: int = 0,            # warmup PDE multiplier 0 -> 1
@@ -97,13 +105,25 @@ class PDE_AdamW_LRMP(torch.optim.Optimizer):
         pde_min_mult: float = 0.1,            # multiplier at end of decay
 
         # ============================
-        # NEW: update-to-weight coupling
+        # update-to-weight coupling
         # ============================
         u_beta: float = 0.9,                  # EMA for update/weight ratio (0 disables)
         u_target: float = 1e-3,               # target ratio
         u_gain: float = 1.0,                  # exponent for scaling
         u_mult_min: float = 0.5,
         u_mult_max: float = 2.0,
+
+        # ============================
+        # NEW: mixing / geometry controls
+        # ============================
+        pde_log_mix: bool = True,             # geometric interpolation for r <-> rs
+        pde_mix_eps: float = 1e-12,           # clamp_min before log in log-mix
+        pde_preserve_mean: bool = True,       # keep mean(r) after PDE (prevents LR drift)
+        pde_preserve_clip_lo: float = 0.5,
+        pde_preserve_clip_hi: float = 2.0,
+
+        pde_only_conv: bool = True,           # apply PDE only on conv kernels (ndim==4)
+        pde_allow_mnist_first_linear: bool = False,  # allow ndim==2 with in_features==28*28
     ):
         # Backward compatibility
         if beta_g is None and beta_r is not None:
@@ -111,21 +131,29 @@ class PDE_AdamW_LRMP(torch.optim.Optimizer):
 
         defaults = dict(
             lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
-            rho0=rho0, lr_cap=lr_cap, clip_update=clip_update,
+
+            rho0=float(rho0),
+            rho_min=float(rho_min),
+            rho_max=(float(rho_max) if rho_max is not None else None),
+
+            lr_cap=lr_cap, clip_update=clip_update,
             rho_mode=rho_mode, rho_const=rho_const,
             beta_g=beta_g,
+
             use_time_filter=use_time_filter, time_beta=time_beta,
             pde_mode=pde_mode, saitoh_rho_alpha=saitoh_rho_alpha, saitoh_eps=saitoh_eps,
+
             linear_hw=linear_hw,
             allow_rect_linear=allow_rect_linear,
             min_rect_side=min_rect_side,
+
             pde_every=int(max(1, pde_every)),
             min_param_numel=int(max(0, min_param_numel)),
             track_smoothness=track_smoothness,
 
-            # NEW
             use_log_smooth=bool(use_log_smooth),
             log_smooth_delta=float(log_smooth_delta),
+
             q_clip=float(q_clip),
             q_quantile=(float(q_quantile) if q_quantile is not None else None),
             rho_ema_beta=float(rho_ema_beta),
@@ -141,6 +169,16 @@ class PDE_AdamW_LRMP(torch.optim.Optimizer):
             u_gain=float(u_gain),
             u_mult_min=float(u_mult_min),
             u_mult_max=float(u_mult_max),
+
+            # NEW
+            pde_log_mix=bool(pde_log_mix),
+            pde_mix_eps=float(pde_mix_eps),
+            pde_preserve_mean=bool(pde_preserve_mean),
+            pde_preserve_clip_lo=float(pde_preserve_clip_lo),
+            pde_preserve_clip_hi=float(pde_preserve_clip_hi),
+
+            pde_only_conv=bool(pde_only_conv),
+            pde_allow_mnist_first_linear=bool(pde_allow_mnist_first_linear),
         )
         super().__init__(params, defaults)
 
@@ -221,7 +259,16 @@ class PDE_AdamW_LRMP(torch.optim.Optimizer):
             beta1, beta2 = group["betas"]
             eps = float(group["eps"])
             wd = float(group["weight_decay"])
-            rho0 = float(group["rho0"])
+
+            rho0 = float(group.get("rho0", 0.1))
+            rho_min = float(group.get("rho_min", 0.0))
+            rho_max = group.get("rho_max", None)
+            rho_max = float(rho_max) if rho_max is not None else float(rho0)  # backward compat
+
+            # sanitize rho bounds
+            rho_min = float(max(0.0, min(0.999, rho_min)))
+            rho_max = float(max(rho_min, min(0.999, rho_max)))
+
             lr_cap = float(group["lr_cap"])
             clip_update = group["clip_update"]
 
@@ -247,27 +294,43 @@ class PDE_AdamW_LRMP(torch.optim.Optimizer):
             min_param_numel = int(group.get("min_param_numel", 0))
             track_smoothness = bool(group.get("track_smoothness", False))
 
-            # NEW knobs
+            # log smoothing
             use_log_smooth = bool(group.get("use_log_smooth", True))
             log_delta = float(group.get("log_smooth_delta", 1e-12))
 
+            # q/rho smoothing
             q_clip = float(group.get("q_clip", 10.0))
             q_quantile = group.get("q_quantile", None)
             q_quantile = float(q_quantile) if q_quantile is not None else None
-
             rho_ema_beta = float(group.get("rho_ema_beta", 0.9))
 
+            # schedules
             rho_warmup_steps = int(group.get("rho_warmup_steps", 0))
             pde_warmup_steps = int(group.get("pde_warmup_steps", 0))
             pde_decay_start = int(group.get("pde_decay_start", 0))
             pde_decay_end = int(group.get("pde_decay_end", 0))
             pde_min_mult = float(group.get("pde_min_mult", 0.1))
 
+            # update-to-weight coupling
             u_beta = float(group.get("u_beta", 0.9))
             u_target = float(group.get("u_target", 1e-3))
             u_gain = float(group.get("u_gain", 1.0))
             u_mult_min = float(group.get("u_mult_min", 0.5))
             u_mult_max = float(group.get("u_mult_max", 2.0))
+
+            # NEW: mixing/geometry
+            pde_log_mix = bool(group.get("pde_log_mix", True))
+            pde_mix_eps = float(group.get("pde_mix_eps", 1e-12))
+            pde_mix_eps = float(max(1e-20, pde_mix_eps))
+
+            pde_preserve_mean = bool(group.get("pde_preserve_mean", True))
+            pde_preserve_clip_lo = float(group.get("pde_preserve_clip_lo", 0.5))
+            pde_preserve_clip_hi = float(group.get("pde_preserve_clip_hi", 2.0))
+            if pde_preserve_clip_hi < pde_preserve_clip_lo:
+                pde_preserve_clip_hi = pde_preserve_clip_lo
+
+            pde_only_conv = bool(group.get("pde_only_conv", True))
+            pde_allow_mnist_first_linear = bool(group.get("pde_allow_mnist_first_linear", False))
 
             # PDE schedule multiplier (group-level)
             pde_mult = self._pde_schedule_mult(
@@ -324,6 +387,7 @@ class PDE_AdamW_LRMP(torch.optim.Optimizer):
                     rho = 0.0
                 elif rho_mode == "const":
                     rho = float(rho_const if rho_const is not None else rho0)
+                    rho = float(max(0.0, min(0.999, rho)))
                 else:
                     # q_t: noise indicator (compute in fp32 for AMP stability)
                     if beta_g is not None:
@@ -342,13 +406,14 @@ class PDE_AdamW_LRMP(torch.optim.Optimizer):
                         q_elem = (vh - mh.pow(2)).clamp_min(0.0) / (vh + 1e-12)
 
                     if q_quantile is not None:
-                        # e.g. median: q_quantile=0.5
                         q_val = torch.quantile(q_elem.reshape(-1), q_quantile)
                         q_val = torch.clamp(q_val, 0.0, q_clip)
                     else:
                         q_val = q_elem.clamp(0.0, q_clip).mean()
 
-                    rho_t = rho0 + (1.0 - rho0) * torch.tanh(q_val)
+                    # UPDATED mapping (Option B):
+                    # rho = rho_min + (rho_max - rho_min) * tanh(q)
+                    rho_t = rho_min + (rho_max - rho_min) * torch.tanh(q_val)
                     rho = float(torch.clamp(rho_t, 0.0, 0.999).item())
 
                 # rho EMA (per-parameter) to reduce jitter
@@ -379,7 +444,6 @@ class PDE_AdamW_LRMP(torch.optim.Optimizer):
                 if u_beta > 0.0 and u_target > 0.0:
                     u_ema_prev = float(state.get("u_ema", u_target))
                     ratio = u_ema_prev / float(u_target)
-                    # if ratio>1 => updates too big => more smoothing
                     u_mult = float(ratio ** float(u_gain))
                     u_mult = float(max(u_mult_min, min(u_mult_max, u_mult)))
 
@@ -394,10 +458,18 @@ class PDE_AdamW_LRMP(torch.optim.Optimizer):
                 # -------------------------
                 # PDE smoothing (only on eligible tensors)
                 # -------------------------
+                is_conv = (p.ndim == 4)
+                is_mnist_first_linear = (p.ndim == 2 and int(p.shape[1]) == 28 * 28)
+
+                if pde_only_conv:
+                    geom_ok = is_conv or (pde_allow_mnist_first_linear and is_mnist_first_linear)
+                else:
+                    geom_ok = (p.ndim in (2, 4))
+
                 do_pde = (
                     self.op is not None
                     and rho_pde > 0.0
-                    and p.ndim in (2, 4)
+                    and geom_ok
                     and p.numel() >= min_param_numel
                 )
 
@@ -446,11 +518,24 @@ class PDE_AdamW_LRMP(torch.optim.Optimizer):
                     else:
                         rs = state["pde_rs"].to(device=r.device, dtype=r.dtype)
 
+                    # NEW: preserve mean/DC of r (prevents implicit LR change)
+                    if pde_preserve_mean:
+                        r_mean = r.float().mean()
+                        rs_mean = rs.float().mean()
+                        scale = (r_mean / (rs_mean + 1e-12)).clamp(pde_preserve_clip_lo, pde_preserve_clip_hi)
+                        rs = rs * scale
+
                     if track_smoothness and need_refresh:
                         self._maybe_track(p, r, rs)
 
-                    # Mix
-                    r = (1.0 - rho_pde) * r + rho_pde * rs
+                    # NEW: log-space mixing (geometric interpolation) by default
+                    if pde_log_mix:
+                        r = torch.exp(
+                            (1.0 - rho_pde) * torch.log(r.clamp_min(pde_mix_eps)) +
+                            rho_pde * torch.log(rs.clamp_min(pde_mix_eps))
+                        )
+                    else:
+                        r = (1.0 - rho_pde) * r + rho_pde * rs
 
                 # -------------------------
                 # Update
@@ -471,7 +556,6 @@ class PDE_AdamW_LRMP(torch.optim.Optimizer):
                 # Update u_ema after we know upd (for next step)
                 # -------------------------
                 if u_beta > 0.0 and u_target > 0.0:
-                    # ||Δθ|| / (||θ|| + eps)
                     denom = float(p.data.norm().item()) + 1e-12
                     numer = float(upd.norm().item())
                     u_now = numer / denom
